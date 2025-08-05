@@ -6,6 +6,11 @@ from typing import Dict, List, Optional, Tuple
 import matplotlib.pyplot as plt
 from collections import defaultdict
 import torch
+import multiprocessing as mp
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import psutil
+import threading
+from functools import partial
 
 from alphazero_agent import AlphaZeroAgent
 from neural_networks import create_network
@@ -23,6 +28,9 @@ class TrainingManager:
         """
         self.config = config
         self.setup_directories()
+        
+        # Setup parallel processing
+        self.setup_parallel_processing()
         
         # Create agents
         self.current_agent = AlphaZeroAgent(
@@ -55,12 +63,19 @@ class TrainingManager:
             'avg_game_length': [],
             'evaluation_time': [],
             'training_time': [],
-            'self_play_time': []
+            'self_play_time': [],
+            'cpu_usage': [],
+            'gpu_usage': [],
+            'memory_usage': []
         }
         
         # Best model tracking
         self.best_win_rate = 0.0
         self.iterations_without_improvement = 0
+        
+        # Resource monitoring
+        self.resource_monitor = ResourceMonitor()
+        self.monitoring_active = False
         
     def setup_directories(self):
         """Setup directories for saving models and logs"""
@@ -69,6 +84,26 @@ class TrainingManager:
         
         os.makedirs(self.model_dir, exist_ok=True)
         os.makedirs(self.log_dir, exist_ok=True)
+    
+    def setup_parallel_processing(self):
+        """Setup parallel processing configuration"""
+        # CPU cores
+        self.num_cpu_cores = mp.cpu_count()
+        self.max_workers = self.config.get('max_workers', max(1, self.num_cpu_cores - 1))
+        
+        # GPU availability
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.gpu_available = torch.cuda.is_available()
+        
+        print(f"Parallel Processing Setup:")
+        print(f"  CPU cores: {self.num_cpu_cores}")
+        print(f"  Max workers: {self.max_workers}")
+        print(f"  Device: {self.device}")
+        print(f"  GPU available: {self.gpu_available}")
+        
+        if self.gpu_available:
+            print(f"  GPU: {torch.cuda.get_device_name()}")
+            print(f"  GPU memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
     
     def load_existing_models(self):
         """Load existing models if available"""
@@ -163,44 +198,176 @@ class TrainingManager:
         print("\nTraining completed!")
     
     def run_self_play(self) -> int:
-        """Run self-play games"""
+        """Run self-play games in parallel"""
         num_games = self.config.get('self_play_games', 25)
         temperature_schedule = self.config.get('temperature_schedule', None)
         
-        print(f"Running {num_games} self-play games...")
+        print(f"Running {num_games} self-play games in parallel...")
         
-        examples = self.current_agent.self_play(
-            num_games=num_games,
-            temperature_schedule=temperature_schedule
-        )
+        # Start resource monitoring
+        self.start_resource_monitoring()
+        
+        try:
+            # Parallel self-play
+            if self.max_workers > 1 and num_games > 1:
+                examples = self._parallel_self_play(num_games, temperature_schedule)
+            else:
+                # Fallback to sequential
+                examples = self.current_agent.self_play(
+                    num_games=num_games,
+                    temperature_schedule=temperature_schedule
+                )
+        finally:
+            # Stop resource monitoring
+            self.stop_resource_monitoring()
         
         print(f"Generated {len(examples)} training examples")
         return len(examples)
     
+    def _parallel_self_play(self, num_games: int, temperature_schedule: Optional[List[float]]) -> List:
+        """Run self-play games in parallel using multiple processes"""
+        # Distribute games across workers
+        games_per_worker = max(1, num_games // self.max_workers)
+        remaining_games = num_games % self.max_workers
+        
+        # Create tasks
+        tasks = []
+        for i in range(self.max_workers):
+            worker_games = games_per_worker + (1 if i < remaining_games else 0)
+            if worker_games > 0:
+                tasks.append((worker_games, temperature_schedule, self.config))
+        
+        print(f"  Distributing {num_games} games across {len(tasks)} workers")
+        
+        all_examples = []
+        
+        # Use ProcessPoolExecutor for CPU parallelization
+        with ProcessPoolExecutor(max_workers=len(tasks)) as executor:
+            # Submit tasks
+            future_to_task = {
+                executor.submit(_worker_self_play, task): task 
+                for task in tasks
+            }
+            
+            # Collect results
+            for future in as_completed(future_to_task):
+                task = future_to_task[future]
+                try:
+                    examples = future.result()
+                    all_examples.extend(examples)
+                    print(f"  Worker completed {task[0]} games -> {len(examples)} examples")
+                except Exception as e:
+                    print(f"  Worker failed: {e}")
+        
+        return all_examples
+    
     def train_network(self) -> Dict[str, float]:
-        """Train the neural network"""
+        """Train the neural network with GPU optimization"""
         batch_size = self.config.get('batch_size', 32)
         training_epochs = self.config.get('training_epochs', 10)
         
-        print(f"Training network for {training_epochs} epochs...")
+        # Optimize batch size for GPU
+        if self.gpu_available:
+            # Increase batch size for GPU to maximize utilization
+            gpu_memory_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
+            if gpu_memory_gb >= 8:  # High-end GPU
+                batch_size = min(batch_size * 2, 128)
+            elif gpu_memory_gb >= 4:  # Mid-range GPU
+                batch_size = min(batch_size * 1.5, 96)
+            
+            # Enable mixed precision training if supported
+            if hasattr(torch.cuda, 'is_available') and torch.cuda.get_device_capability()[0] >= 7:
+                torch.backends.cudnn.benchmark = True
         
-        losses = self.current_agent.train(batch_size=batch_size, epochs=training_epochs)
+        print(f"Training network for {training_epochs} epochs (batch_size={batch_size})...")
+        
+        # Start resource monitoring for training
+        self.start_resource_monitoring()
+        
+        try:
+            losses = self.current_agent.train(batch_size=batch_size, epochs=training_epochs)
+        finally:
+            self.stop_resource_monitoring()
         
         print(f"Training loss: {losses['total_loss']:.4f}")
         return losses
     
     def evaluate_agent(self) -> Dict[str, float]:
-        """Evaluate current agent against best agent"""
+        """Evaluate current agent against best agent in parallel"""
         eval_games = self.config.get('evaluation_games', 40)
         
-        print(f"Evaluating agent over {eval_games} games...")
+        print(f"Evaluating agent over {eval_games} games in parallel...")
         
-        results = self.current_agent.evaluate_against(self.best_agent, num_games=eval_games)
+        # Start resource monitoring
+        self.start_resource_monitoring()
+        
+        try:
+            if self.max_workers > 1 and eval_games > 1:
+                results = self._parallel_evaluation(eval_games)
+            else:
+                # Fallback to sequential
+                results = self.current_agent.evaluate_against(self.best_agent, num_games=eval_games)
+        finally:
+            self.stop_resource_monitoring()
         
         print(f"Win rate vs best: {results['win_rate']:.3f} "
               f"({results['wins']}/{eval_games})")
         
         return results
+    
+    def _parallel_evaluation(self, num_games: int) -> Dict[str, float]:
+        """Run evaluation games in parallel"""
+        # Distribute games across workers
+        games_per_worker = max(1, num_games // self.max_workers)
+        remaining_games = num_games % self.max_workers
+        
+        # Create tasks
+        tasks = []
+        for i in range(self.max_workers):
+            worker_games = games_per_worker + (1 if i < remaining_games else 0)
+            if worker_games > 0:
+                tasks.append((worker_games, self.config))
+        
+        print(f"  Distributing {num_games} evaluation games across {len(tasks)} workers")
+        
+        total_wins = 0
+        total_draws = 0
+        total_losses = 0
+        total_moves = 0
+        total_time = 0
+        
+        # Use ProcessPoolExecutor for CPU parallelization
+        with ProcessPoolExecutor(max_workers=len(tasks)) as executor:
+            # Submit tasks
+            future_to_task = {
+                executor.submit(_worker_evaluation, task): task 
+                for task in tasks
+            }
+            
+            # Collect results
+            for future in as_completed(future_to_task):
+                task = future_to_task[future]
+                try:
+                    result = future.result()
+                    total_wins += result['wins']
+                    total_draws += result['draws']
+                    total_losses += result['losses']
+                    total_moves += result['total_moves']
+                    total_time += result['total_time']
+                    print(f"  Worker completed {task[0]} evaluation games")
+                except Exception as e:
+                    print(f"  Evaluation worker failed: {e}")
+        
+        # Calculate final results
+        total_games = total_wins + total_draws + total_losses
+        return {
+            'wins': total_wins,
+            'draws': total_draws,
+            'losses': total_losses,
+            'win_rate': total_wins / total_games if total_games > 0 else 0.0,
+            'avg_game_length': total_moves / total_games if total_games > 0 else 0.0,
+            'avg_time_per_game': total_time / total_games if total_games > 0 else 0.0
+        }
     
     def manage_models(self, win_rate: float):
         """Manage best model updates"""
@@ -379,30 +546,196 @@ class TrainingManager:
             print(f"Training curves saved to {plot_path}")
         
         plt.close()  # Close the figure to free memory
+    
+    def start_resource_monitoring(self):
+        """Start resource monitoring in background thread"""
+        if not self.monitoring_active:
+            self.monitoring_active = True
+            self.resource_monitor.start_monitoring()
+    
+    def stop_resource_monitoring(self):
+        """Stop resource monitoring and record metrics"""
+        if self.monitoring_active:
+            self.monitoring_active = False
+            metrics = self.resource_monitor.stop_monitoring()
+            
+            # Add to training history
+            self.training_history['cpu_usage'].append(metrics['avg_cpu_usage'])
+            self.training_history['gpu_usage'].append(metrics['avg_gpu_usage'])
+            self.training_history['memory_usage'].append(metrics['avg_memory_usage'])
+
+
+class ResourceMonitor:
+    """Monitor CPU, GPU, and memory usage during training"""
+    
+    def __init__(self):
+        self.monitoring = False
+        self.monitor_thread = None
+        self.metrics = {
+            'cpu_usage': [],
+            'gpu_usage': [],
+            'memory_usage': []
+        }
+    
+    def start_monitoring(self):
+        """Start monitoring in background thread"""
+        if not self.monitoring:
+            self.monitoring = True
+            self.metrics = {'cpu_usage': [], 'gpu_usage': [], 'memory_usage': []}
+            self.monitor_thread = threading.Thread(target=self._monitor_loop)
+            self.monitor_thread.daemon = True
+            self.monitor_thread.start()
+    
+    def stop_monitoring(self) -> Dict[str, float]:
+        """Stop monitoring and return average metrics"""
+        self.monitoring = False
+        if self.monitor_thread:
+            self.monitor_thread.join(timeout=1.0)
+        
+        # Calculate averages
+        avg_metrics = {
+            'avg_cpu_usage': np.mean(self.metrics['cpu_usage']) if self.metrics['cpu_usage'] else 0.0,
+            'avg_gpu_usage': np.mean(self.metrics['gpu_usage']) if self.metrics['gpu_usage'] else 0.0,
+            'avg_memory_usage': np.mean(self.metrics['memory_usage']) if self.metrics['memory_usage'] else 0.0
+        }
+        
+        return avg_metrics
+    
+    def _monitor_loop(self):
+        """Background monitoring loop"""
+        while self.monitoring:
+            try:
+                # CPU usage
+                cpu_percent = psutil.cpu_percent(interval=0.1)
+                self.metrics['cpu_usage'].append(cpu_percent)
+                
+                # Memory usage
+                memory_percent = psutil.virtual_memory().percent
+                self.metrics['memory_usage'].append(memory_percent)
+                
+                # GPU usage (if available)
+                if torch.cuda.is_available():
+                    try:
+                        gpu_memory_used = torch.cuda.memory_allocated() / torch.cuda.max_memory_allocated() * 100
+                        self.metrics['gpu_usage'].append(gpu_memory_used)
+                    except:
+                        self.metrics['gpu_usage'].append(0.0)
+                else:
+                    self.metrics['gpu_usage'].append(0.0)
+                
+                time.sleep(1.0)  # Sample every second
+            except Exception:
+                # Continue monitoring even if one measurement fails
+                continue
+
+
+def _worker_self_play(task: Tuple) -> List:
+    """Worker function for parallel self-play"""
+    num_games, temperature_schedule, config = task
+    
+    # Create agent for this worker
+    agent = AlphaZeroAgent(
+        network_type=config['network_type'],
+        num_simulations=config['num_simulations'],
+        c_puct=config['c_puct'],
+        temperature=config['temperature'],
+        **config.get('network_kwargs', {})
+    )
+    
+    # Load model if exists
+    model_path = os.path.join(config.get('model_dir', 'models'), 'final_model_current')
+    if os.path.exists(model_path + '_agent.pkl'):
+        try:
+            agent.load_agent(model_path)
+        except Exception:
+            pass  # Use fresh agent if loading fails
+    
+    # Run self-play
+    return agent.self_play(num_games=num_games, temperature_schedule=temperature_schedule)
+
+
+def _worker_evaluation(task: Tuple) -> Dict:
+    """Worker function for parallel evaluation"""
+    num_games, config = task
+    
+    # Create current and best agents for this worker
+    current_agent = AlphaZeroAgent(
+        network_type=config['network_type'],
+        num_simulations=config['num_simulations'],
+        c_puct=config['c_puct'],
+        temperature=0.0,
+        **config.get('network_kwargs', {})
+    )
+    
+    best_agent = AlphaZeroAgent(
+        network_type=config['network_type'],
+        num_simulations=config['num_simulations'],
+        c_puct=config['c_puct'],
+        temperature=0.0,
+        **config.get('network_kwargs', {})
+    )
+    
+    # Load models
+    model_dir = config.get('model_dir', 'models')
+    
+    current_path = os.path.join(model_dir, 'final_model_current')
+    if os.path.exists(current_path + '_agent.pkl'):
+        try:
+            current_agent.load_agent(current_path)
+        except Exception:
+            pass
+    
+    best_path = os.path.join(model_dir, 'final_model_best')
+    if os.path.exists(best_path + '_agent.pkl'):
+        try:
+            best_agent.load_agent(best_path)
+        except Exception:
+            pass
+    
+    # Run evaluation
+    result = current_agent.evaluate_against(best_agent, num_games=num_games)
+    
+    # Return detailed metrics for aggregation
+    return {
+        'wins': result['wins'],
+        'draws': result.get('draws', 0),
+        'losses': result.get('losses', num_games - result['wins'] - result.get('draws', 0)),
+        'total_moves': result.get('avg_game_length', 50) * num_games,
+        'total_time': result.get('avg_time_per_game', 1.0) * num_games
+    }
 
 
 def get_default_config(network_type: str = 'resnet') -> Dict:
-    """Get default training configuration"""
+    """Get default training configuration with parallel processing"""
+    # Detect available resources
+    num_cores = mp.cpu_count()
+    gpu_available = torch.cuda.is_available()
+    
     config = {
         'network_type': network_type,
-        'num_simulations': 200,  # Reduced for faster training
+        'num_simulations': 400 if gpu_available else 200,  # More simulations if GPU available
         'c_puct': 1.0,
         'temperature': 1.0,
         'temperature_schedule': [1.0] * 10 + [0.5] * 10 + [0.1],  # Decay temperature
         
-        # Training parameters
-        'self_play_games': 25,
-        'batch_size': 32,
+        # Training parameters - optimized for parallel processing
+        'self_play_games': max(25, num_cores * 4),  # Scale with CPU cores
+        'batch_size': 64 if gpu_available else 32,  # Larger batches for GPU
         'training_epochs': 10,
-        'evaluation_games': 20,  # Reduced from 40 for faster training
+        'evaluation_games': max(20, num_cores * 2),  # Scale evaluation games
         'improvement_threshold': 0.55,
         'max_iterations_without_improvement': 30,
+        
+        # Parallel processing parameters
+        'max_workers': max(1, num_cores - 1),  # Leave one core for system
+        'enable_gpu_optimization': gpu_available,
+        'mixed_precision': gpu_available and torch.cuda.get_device_capability()[0] >= 7,
         
         # Network parameters
         'network_kwargs': {
             'input_channels': 3,
             'num_actions': 600,
-            'learning_rate': 0.001
+            'learning_rate': 0.002 if gpu_available else 0.001  # Higher LR for GPU
         },
         
         # Logging

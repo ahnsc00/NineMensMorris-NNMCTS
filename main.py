@@ -46,6 +46,9 @@ def train_agent(args):
     print(f"  MCTS Simulations: {config['num_simulations']}")
     print(f"  Self-play Games: {config['self_play_games']}")
     print(f"  Batch Size: {config['batch_size']}")
+    print(f"  Max Workers: {config['max_workers']}")
+    print(f"  GPU Optimization: {config['enable_gpu_optimization']}")
+    print(f"  Mixed Precision: {config['mixed_precision']}")
     print(f"  Model Directory: {config['model_dir']}")
     print(f"  Log Directory: {config['log_dir']}")
     print()
@@ -324,6 +327,9 @@ def main():
     # Demo command
     subparsers.add_parser('demo', help='Run quick demonstration')
     
+    # Performance test command
+    subparsers.add_parser('test-performance', help='Test parallel processing performance')
+    
     # Parse arguments
     args = parser.parse_args()
     
@@ -337,14 +343,18 @@ def main():
         play_human_game()
     elif args.command == 'demo':
         quick_demo()
+    elif args.command == 'test-performance':
+        from test_parallel_performance import main as test_performance
+        test_performance()
     else:
         parser.print_help()
         print("\nAvailable commands:")
-        print("  train     - Train an AlphaZero agent")
-        print("  evaluate  - Evaluate trained agents")
-        print("  play      - Play against a trained agent")
-        print("  human     - Play human vs human")
-        print("  demo      - Run quick demonstration")
+        print("  train            - Train an AlphaZero agent")
+        print("  evaluate         - Evaluate trained agents")
+        print("  play             - Play against a trained agent")
+        print("  human            - Play human vs human")
+        print("  demo             - Run quick demonstration")
+        print("  test-performance - Test parallel processing performance")
         print("\nExample usage:")
         print("  python main.py train --network resnet --iterations 100")
         print("  python main.py evaluate --games 50")

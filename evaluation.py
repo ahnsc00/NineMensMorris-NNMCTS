@@ -8,6 +8,9 @@ import matplotlib.pyplot as plt
 from typing import Dict, List, Tuple, Optional
 from collections import defaultdict
 import random
+import multiprocessing as mp
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from functools import partial
 
 from nine_mens_morris import NineMensMorris, Player
 from alphazero_agent import AlphaZeroAgent
@@ -17,10 +20,14 @@ from neural_networks import create_network
 class ModelEvaluator:
     """Evaluate and compare different models"""
     
-    def __init__(self, models_dir: str = 'models'):
+    def __init__(self, models_dir: str = 'models', max_workers: Optional[int] = None):
         self.models_dir = models_dir
         self.agents = {}
         self.evaluation_results = {}
+        
+        # Parallel processing setup
+        self.max_workers = max_workers or max(1, mp.cpu_count() - 1)
+        print(f"ModelEvaluator initialized with {self.max_workers} max workers")
     
     def load_agents(self, agent_configs: List[Dict]):
         """
@@ -143,7 +150,19 @@ class ModelEvaluator:
     
     def play_match(self, agent1: AlphaZeroAgent, agent2: AlphaZeroAgent, 
                    num_games: int) -> Dict[str, float]:
-        """Play a match between two agents"""
+        """Play a match between two agents with parallel processing"""
+        print(f"  Playing {num_games} games...")
+        
+        if self.max_workers > 1 and num_games > 1:
+            # Parallel execution
+            return self._play_match_parallel(agent1, agent2, num_games)
+        else:
+            # Sequential execution (fallback)
+            return self._play_match_sequential(agent1, agent2, num_games)
+    
+    def _play_match_sequential(self, agent1: AlphaZeroAgent, agent2: AlphaZeroAgent, 
+                              num_games: int) -> Dict[str, float]:
+        """Play a match sequentially (original implementation)"""
         wins = 0
         losses = 0
         draws = 0
@@ -178,6 +197,70 @@ class ModelEvaluator:
             'win_rate': wins / num_games,
             'avg_game_length': total_moves / num_games,
             'avg_time_per_move': total_time / total_moves if total_moves > 0 else 0
+        }
+    
+    def _play_match_parallel(self, agent1: AlphaZeroAgent, agent2: AlphaZeroAgent, 
+                            num_games: int) -> Dict[str, float]:
+        """Play a match using parallel processing"""
+        # Distribute games across workers
+        games_per_worker = max(1, num_games // self.max_workers)
+        remaining_games = num_games % self.max_workers
+        
+        # Create tasks for workers
+        tasks = []
+        for i in range(self.max_workers):
+            worker_games = games_per_worker + (1 if i < remaining_games else 0)
+            if worker_games > 0:
+                # Create agent configs for serialization
+                agent1_config = self._extract_agent_config(agent1)
+                agent2_config = self._extract_agent_config(agent2)
+                tasks.append((agent1_config, agent2_config, worker_games, i))
+        
+        # Execute tasks in parallel
+        total_wins = 0
+        total_losses = 0
+        total_draws = 0
+        total_moves = 0
+        total_time = 0
+        
+        with ProcessPoolExecutor(max_workers=len(tasks)) as executor:
+            # Submit tasks
+            future_to_task = {
+                executor.submit(_worker_play_match, task): task 
+                for task in tasks
+            }
+            
+            # Collect results
+            for future in as_completed(future_to_task):
+                task = future_to_task[future]
+                try:
+                    result = future.result()
+                    total_wins += result['wins']
+                    total_losses += result['losses']
+                    total_draws += result['draws']
+                    total_moves += result['total_moves']
+                    total_time += result['total_time']
+                    print(f"    Worker {task[3]} completed {task[2]} games")
+                except Exception as e:
+                    print(f"    Worker {task[3]} failed: {e}")
+        
+        return {
+            'wins': total_wins,
+            'losses': total_losses,
+            'draws': total_draws,
+            'win_rate': total_wins / num_games if num_games > 0 else 0.0,
+            'avg_game_length': total_moves / num_games if num_games > 0 else 0.0,
+            'avg_time_per_move': total_time / total_moves if total_moves > 0 else 0.0
+        }
+    
+    def _extract_agent_config(self, agent: AlphaZeroAgent) -> Dict:
+        """Extract agent configuration for serialization"""
+        return {
+            'network_type': agent.network_type,
+            'num_simulations': agent.num_simulations,
+            'c_puct': agent.c_puct,
+            'temperature': agent.temperature,
+            'model_path': None  # Will be handled by worker
         }
     
     def play_single_game(self, player1: AlphaZeroAgent, player2: AlphaZeroAgent) -> Tuple[int, int]:
@@ -394,13 +477,124 @@ class ModelEvaluator:
         print(f"Tournament results plot saved to {output_file}")
 
 
-def quick_evaluation_demo():
-    """Run a quick evaluation demo"""
-    print("Running Quick Evaluation Demo")
-    print("=" * 40)
+def _worker_play_match(task: Tuple) -> Dict:
+    """Worker function for parallel match evaluation"""
+    agent1_config, agent2_config, num_games, worker_id = task
     
-    # Create evaluator
-    evaluator = ModelEvaluator()
+    # Create agents for this worker
+    agent1 = AlphaZeroAgent(
+        network_type=agent1_config['network_type'],
+        num_simulations=agent1_config['num_simulations'],
+        c_puct=agent1_config['c_puct'],
+        temperature=agent1_config['temperature']
+    )
+    
+    agent2 = AlphaZeroAgent(
+        network_type=agent2_config['network_type'],
+        num_simulations=agent2_config['num_simulations'],
+        c_puct=agent2_config['c_puct'],
+        temperature=agent2_config['temperature']
+    )
+    
+    # Load models if they exist (best effort)
+    try:
+        if os.path.exists('models/final_model_current_agent.pkl'):
+            agent1.load_agent('models/final_model_current')
+        if os.path.exists('models/final_model_best_agent.pkl'):
+            agent2.load_agent('models/final_model_best')
+    except Exception:
+        pass  # Use fresh agents if loading fails
+    
+    # Play games
+    wins = 0
+    losses = 0
+    draws = 0
+    total_moves = 0
+    total_time = 0
+    
+    for game_idx in range(num_games):
+        start_time = time.time()
+        
+        # Alternate who goes first
+        if game_idx % 2 == 0:
+            result, moves = _play_single_game_worker(agent1, agent2)
+        else:
+            result, moves = _play_single_game_worker(agent2, agent1)
+            result = -result  # Flip result for agent1's perspective
+        
+        game_time = time.time() - start_time
+        total_time += game_time
+        total_moves += moves
+        
+        if result == 1:
+            wins += 1
+        elif result == -1:
+            losses += 1
+        else:
+            draws += 1
+    
+    return {
+        'wins': wins,
+        'losses': losses,
+        'draws': draws,
+        'total_moves': total_moves,
+        'total_time': total_time
+    }
+
+
+def _play_single_game_worker(player1: AlphaZeroAgent, player2: AlphaZeroAgent) -> Tuple[int, int]:
+    """Play a single game between two agents (worker version)"""
+    game = NineMensMorris()
+    move_count = 0
+    max_moves = 300  # Prevent infinite games
+    
+    while move_count < max_moves:
+        current_player = game.get_current_player()
+        
+        # Select agent
+        if current_player == Player.PLAYER1:
+            agent = player1
+        else:
+            agent = player2
+        
+        # Get action
+        try:
+            action = agent.get_action(game, temperature=0.0)
+        except:
+            # If agent fails, random move
+            valid_moves = game.get_valid_moves()
+            action = random.choice(valid_moves) if valid_moves else (0,)
+        
+        # Make move
+        success = game.make_move(action)
+        if not success:
+            # Invalid move, opponent wins
+            winner = Player.PLAYER2 if current_player == Player.PLAYER1 else Player.PLAYER1
+            result = 1 if winner == Player.PLAYER1 else -1
+            return result, move_count
+        
+        move_count += 1
+        
+        # Check for game end
+        game_over, winner = game.is_game_over()
+        if game_over:
+            if winner is None:
+                return 0, move_count  # Draw
+            elif winner == Player.PLAYER1:
+                return 1, move_count  # Player 1 wins
+            else:
+                return -1, move_count  # Player 2 wins
+    
+    return 0, move_count  # Draw (game too long)
+
+
+def quick_evaluation_demo():
+    """Run a quick evaluation demo with parallel processing"""
+    print("Running Quick Evaluation Demo (Parallel)")
+    print("=" * 50)
+    
+    # Create evaluator with parallel processing
+    evaluator = ModelEvaluator(max_workers=mp.cpu_count() - 1)
     
     # Create baseline agents
     evaluator.create_baseline_agents()
@@ -414,8 +608,8 @@ def quick_evaluation_demo():
             'num_simulations': 200
         }])
     
-    # Run tournament
-    results = evaluator.round_robin_tournament(num_games_per_match=10)
+    # Run tournament with more games due to parallel processing
+    results = evaluator.round_robin_tournament(num_games_per_match=20)
     
     # Generate report
     evaluator.generate_report(results, 'quick_evaluation_report.txt')

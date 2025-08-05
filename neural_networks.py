@@ -4,6 +4,7 @@ import torch.nn.functional as F
 import numpy as np
 from typing import Tuple, Optional
 from abc import ABC, abstractmethod
+import time
 
 class NeuralNetwork(ABC):
     """Abstract base class for neural networks"""
@@ -42,7 +43,7 @@ class NeuralNetwork(ABC):
 
 
 class CNNNetwork(nn.Module, NeuralNetwork):
-    """CNN-based neural network for Nine Men's Morris"""
+    """CNN-based neural network for Nine Men's Morris with GPU optimization"""
     
     def __init__(self, input_channels: int = 3, hidden_size: int = 256, 
                  num_actions: int = 600, learning_rate: float = 0.001):
@@ -52,17 +53,20 @@ class CNNNetwork(nn.Module, NeuralNetwork):
         self.hidden_size = hidden_size
         self.num_actions = num_actions
         
-        # CNN layers
+        # CNN layers with better initialization
         self.conv1 = nn.Conv2d(input_channels, 32, kernel_size=3, padding=1)
         self.conv2 = nn.Conv2d(32, 64, kernel_size=3, padding=1)
         self.conv3 = nn.Conv2d(64, 128, kernel_size=3, padding=1)
         self.conv4 = nn.Conv2d(128, 256, kernel_size=3, padding=1)
         
-        # Batch normalization
-        self.bn1 = nn.BatchNorm2d(32)
-        self.bn2 = nn.BatchNorm2d(64)
-        self.bn3 = nn.BatchNorm2d(128)
-        self.bn4 = nn.BatchNorm2d(256)
+        # Batch normalization with momentum optimization
+        self.bn1 = nn.BatchNorm2d(32, momentum=0.1)
+        self.bn2 = nn.BatchNorm2d(64, momentum=0.1)
+        self.bn3 = nn.BatchNorm2d(128, momentum=0.1)
+        self.bn4 = nn.BatchNorm2d(256, momentum=0.1)
+        
+        # Dropout for regularization
+        self.dropout = nn.Dropout(0.1)
         
         # Calculate flattened size
         self.flattened_size = 256 * 7 * 7  # 256 channels * 7x7 board
@@ -74,6 +78,7 @@ class CNNNetwork(nn.Module, NeuralNetwork):
         self.policy_head = nn.Sequential(
             nn.Linear(hidden_size, hidden_size // 2),
             nn.ReLU(),
+            nn.Dropout(0.1),
             nn.Linear(hidden_size // 2, num_actions),
             nn.Softmax(dim=-1)
         )
@@ -82,28 +87,58 @@ class CNNNetwork(nn.Module, NeuralNetwork):
         self.value_head = nn.Sequential(
             nn.Linear(hidden_size, hidden_size // 4),
             nn.ReLU(),
+            nn.Dropout(0.1),
             nn.Linear(hidden_size // 4, 1),
             nn.Tanh()
         )
         
-        # Optimizer
-        self.optimizer = torch.optim.Adam(self.parameters(), lr=learning_rate)
+        # Initialize weights
+        self._initialize_weights()
+        
+        # Optimizer with weight decay for better generalization
+        self.optimizer = torch.optim.AdamW(self.parameters(), lr=learning_rate, weight_decay=1e-4)
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.to(self.device)
         
+        # Mixed precision training setup
+        self.scaler = torch.cuda.amp.GradScaler() if torch.cuda.is_available() else None
+        self.use_amp = torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 7
+        
+        # Compile model for PyTorch 2.0+ if available
+        if hasattr(torch, 'compile'):
+            try:
+                self = torch.compile(self)
+            except:
+                pass  # Fallback if compilation fails
+    
+    def _initialize_weights(self):
+        """Initialize weights using He initialization"""
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.Linear):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                nn.init.constant_(m.bias, 0)
+        
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Forward pass"""
+        """Forward pass with optimizations"""
         # CNN layers with batch norm and ReLU
-        x = F.relu(self.bn1(self.conv1(x)))
-        x = F.relu(self.bn2(self.conv2(x)))
-        x = F.relu(self.bn3(self.conv3(x)))
-        x = F.relu(self.bn4(self.conv4(x)))
+        x = F.relu(self.bn1(self.conv1(x)), inplace=True)
+        x = F.relu(self.bn2(self.conv2(x)), inplace=True)
+        x = F.relu(self.bn3(self.conv3(x)), inplace=True)
+        x = F.relu(self.bn4(self.conv4(x)), inplace=True)
         
         # Flatten
         x = x.view(x.size(0), -1)
         
-        # Common fully connected layer
-        x = F.relu(self.fc_common(x))
+        # Common fully connected layer with dropout
+        x = F.relu(self.fc_common(x), inplace=True)
+        x = self.dropout(x)
         
         # Policy and value heads
         policy = self.policy_head(x)
@@ -130,32 +165,59 @@ class CNNNetwork(nn.Module, NeuralNetwork):
     
     def train_step(self, batch_boards: np.ndarray, batch_policies: np.ndarray, 
                    batch_values: np.ndarray) -> dict:
-        """Perform one training step"""
+        """Perform one training step with GPU optimization"""
+        start_time = time.time()
         self.train()
         
-        # Convert to tensors
-        boards = torch.FloatTensor(batch_boards).to(self.device)
-        target_policies = torch.FloatTensor(batch_policies).to(self.device)
-        target_values = torch.FloatTensor(batch_values).to(self.device)
+        # Convert to tensors with non_blocking for GPU optimization
+        boards = torch.FloatTensor(batch_boards).to(self.device, non_blocking=True)
+        target_policies = torch.FloatTensor(batch_policies).to(self.device, non_blocking=True)
+        target_values = torch.FloatTensor(batch_values).to(self.device, non_blocking=True)
         
-        # Forward pass
-        pred_policies, pred_values = self.forward(boards)
+        # Use mixed precision if available
+        if self.use_amp and self.scaler is not None:
+            with torch.cuda.amp.autocast():
+                # Forward pass
+                pred_policies, pred_values = self.forward(boards)
+                
+                # Calculate losses
+                policy_loss = F.kl_div(F.log_softmax(pred_policies, dim=1), target_policies, reduction='batchmean')
+                value_loss = F.mse_loss(pred_values, target_values)
+                total_loss = policy_loss + value_loss
+            
+            # Backward pass with mixed precision
+            self.optimizer.zero_grad()
+            self.scaler.scale(total_loss).backward()
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+        else:
+            # Standard precision training
+            pred_policies, pred_values = self.forward(boards)
+            
+            # Calculate losses
+            policy_loss = F.kl_div(F.log_softmax(pred_policies, dim=1), target_policies, reduction='batchmean')
+            value_loss = F.mse_loss(pred_values, target_values)
+            total_loss = policy_loss + value_loss
+            
+            # Backward pass
+            self.optimizer.zero_grad()
+            total_loss.backward()
+            
+            # Gradient clipping for stability
+            torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=1.0)
+            self.optimizer.step()
         
-        # Calculate losses
-        # Use KL divergence for policy loss instead of cross-entropy
-        policy_loss = F.kl_div(F.log_softmax(pred_policies, dim=1), target_policies, reduction='batchmean')
-        value_loss = F.mse_loss(pred_values, target_values)
-        total_loss = policy_loss + value_loss
+        # Synchronize GPU for accurate timing
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
         
-        # Backward pass
-        self.optimizer.zero_grad()
-        total_loss.backward()
-        self.optimizer.step()
+        training_time = time.time() - start_time
         
         return {
             'total_loss': total_loss.item(),
             'policy_loss': policy_loss.item(),
-            'value_loss': value_loss.item()
+            'value_loss': value_loss.item(),
+            'training_time': training_time
         }
     
     def save_model(self, filepath: str):
@@ -232,10 +294,31 @@ class ResNetNetwork(nn.Module, NeuralNetwork):
         self.value_fc1 = nn.Linear(32 * 7 * 7, 256)
         self.value_fc2 = nn.Linear(256, 1)
         
-        # Optimizer
-        self.optimizer = torch.optim.Adam(self.parameters(), lr=learning_rate, weight_decay=1e-4)
+        # Initialize weights
+        self._initialize_weights()
+        
+        # Optimizer with better settings
+        self.optimizer = torch.optim.AdamW(self.parameters(), lr=learning_rate, weight_decay=1e-4)
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.to(self.device)
+        
+        # Mixed precision training setup
+        self.scaler = torch.cuda.amp.GradScaler() if torch.cuda.is_available() else None
+        self.use_amp = torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 7
+    
+    def _initialize_weights(self):
+        """Initialize weights using He initialization"""
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.Linear):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                nn.init.constant_(m.bias, 0)
     
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """Forward pass"""
@@ -278,32 +361,59 @@ class ResNetNetwork(nn.Module, NeuralNetwork):
     
     def train_step(self, batch_boards: np.ndarray, batch_policies: np.ndarray, 
                    batch_values: np.ndarray) -> dict:
-        """Perform one training step"""
+        """Perform one training step with GPU optimization"""
+        start_time = time.time()
         self.train()
         
-        # Convert to tensors
-        boards = torch.FloatTensor(batch_boards).to(self.device)
-        target_policies = torch.FloatTensor(batch_policies).to(self.device)
-        target_values = torch.FloatTensor(batch_values).to(self.device)
+        # Convert to tensors with non_blocking for GPU optimization
+        boards = torch.FloatTensor(batch_boards).to(self.device, non_blocking=True)
+        target_policies = torch.FloatTensor(batch_policies).to(self.device, non_blocking=True)
+        target_values = torch.FloatTensor(batch_values).to(self.device, non_blocking=True)
         
-        # Forward pass
-        pred_policies, pred_values = self.forward(boards)
+        # Use mixed precision if available
+        if self.use_amp and self.scaler is not None:
+            with torch.cuda.amp.autocast():
+                # Forward pass
+                pred_policies, pred_values = self.forward(boards)
+                
+                # Calculate losses
+                policy_loss = F.kl_div(F.log_softmax(pred_policies, dim=1), target_policies, reduction='batchmean')
+                value_loss = F.mse_loss(pred_values, target_values)
+                total_loss = policy_loss + value_loss
+            
+            # Backward pass with mixed precision
+            self.optimizer.zero_grad()
+            self.scaler.scale(total_loss).backward()
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+        else:
+            # Standard precision training
+            pred_policies, pred_values = self.forward(boards)
+            
+            # Calculate losses
+            policy_loss = F.kl_div(F.log_softmax(pred_policies, dim=1), target_policies, reduction='batchmean')
+            value_loss = F.mse_loss(pred_values, target_values)
+            total_loss = policy_loss + value_loss
+            
+            # Backward pass
+            self.optimizer.zero_grad()
+            total_loss.backward()
+            
+            # Gradient clipping for stability
+            torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=1.0)
+            self.optimizer.step()
         
-        # Calculate losses
-        # Use KL divergence for policy loss instead of cross-entropy
-        policy_loss = F.kl_div(F.log_softmax(pred_policies, dim=1), target_policies, reduction='batchmean')
-        value_loss = F.mse_loss(pred_values, target_values)
-        total_loss = policy_loss + value_loss
+        # Synchronize GPU for accurate timing
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
         
-        # Backward pass
-        self.optimizer.zero_grad()
-        total_loss.backward()
-        self.optimizer.step()
+        training_time = time.time() - start_time
         
         return {
             'total_loss': total_loss.item(),
             'policy_loss': policy_loss.item(),
-            'value_loss': value_loss.item()
+            'value_loss': value_loss.item(),
+            'training_time': training_time
         }
     
     def save_model(self, filepath: str):
