@@ -1,0 +1,32 @@
+{
+  "iteration": [
+    1
+  ],
+  "total_loss": [
+    5.987486410140991
+  ],
+  "policy_loss": [
+    5.817514371871948
+  ],
+  "value_loss": [
+    0.16997205689549447
+  ],
+  "win_rate_vs_best": [
+    0.0
+  ],
+  "games_played": [
+    26
+  ],
+  "avg_game_length": [
+    171.1153846153846
+  ],
+  "evaluation_time": [
+    37.72713494300842
+  ],
+  "training_time": [
+    0.14769220352172852
+  ],
+  "self_play_time": [
+    0.8053739070892334
+  ]
+}

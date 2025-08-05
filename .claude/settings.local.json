@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:github.com)",
+      "Bash(gh auth:*)",
+      "mcp__github__get_me",
+      "Bash(claude mcp remove:*)",
+      "mcp__github__create_repository",
+      "Bash(git init:*)",
+      "Bash(git add:*)"
+    ],
+    "deny": []
+  }
+}

@@ -1,0 +1,30 @@
+NINE MEN'S MORRIS - TOURNAMENT REPORT
+==================================================
+
+Tournament Information:
+  Number of agents: 2
+  Games per matchup: 10
+  Total games played: 10
+
+OVERALL RANKINGS:
+------------------------------
+1. Random
+   Win Rate: 0.500
+   Draw Rate: 0.500
+   Opponents Beaten: 0/1
+   Avg Game Length: 158.3 moves
+
+2. Simple_CNN
+   Win Rate: 0.000
+   Draw Rate: 0.500
+   Opponents Beaten: 0/1
+   Avg Game Length: 158.3 moves
+
+DETAILED MATCHUP RESULTS:
+----------------------------------------
+
+Random vs others:
+  vs Simple_CNN: 0.500 (5-0-5)
+
+Simple_CNN vs others:
+  vs Random: 0.500 (0-5-5)
