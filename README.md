@@ -68,9 +68,6 @@ python main.py train --iterations 25 --games 10          # Fast testing
 
 ## 🛠️ Troubleshooting
 
-```bash
-# Force CPU usage (CUDA issues)
-export CUDA_VISIBLE_DEVICES=""
 
 # Reduce memory usage
 python main.py train --batch-size 16 --games 10
